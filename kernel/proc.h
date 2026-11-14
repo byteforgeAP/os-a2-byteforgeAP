@@ -76,6 +76,9 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+#define MLFQ_LEVELS 4
+#define MLFQ_BOOST  64
+
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
@@ -88,6 +91,13 @@ struct proc {
   int killed;           // If non-zero, have been killed
   int xstate;           // Exit status to be returned to parent's wait
   int pid;              // Process ID
+
+  // Scheduling statistics and MLFQ state (p->lock must be held).
+  int runticks;         // timer ticks charged to this process
+  int nsched;           // times scheduler() switched to this process
+  int ctime;            // ticks when the process was created
+  int level;            // current MLFQ level, 0 (highest) .. MLFQ_LEVELS-1
+  int used;             // ticks used at the current level
 
   // wait_lock must be held when using this:
   struct proc *parent; // Parent process

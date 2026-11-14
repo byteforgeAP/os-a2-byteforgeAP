@@ -81,8 +81,9 @@ usertrap(void)
   if (killed(p))
     kexit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  // on a timer interrupt, charge the tick and let MLFQ decide
+  // whether to give up the CPU.
+  if (which_dev == 2 && mlfq_tick(p))
     yield();
 
   prepare_return();
@@ -153,8 +154,9 @@ kerneltrap()
     panic("kerneltrap");
   }
 
-  // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
+  // on a timer interrupt, charge the tick and let MLFQ decide
+  // whether to give up the CPU.
+  if (which_dev == 2 && myproc() != 0 && mlfq_tick(myproc()))
     yield();
 
   // the yield() may have caused some traps to occur,
@@ -169,6 +171,8 @@ clockintr()
   if (cpuid() == 0) {
     acquire(&tickslock);
     ticks++;
+    if (ticks % MLFQ_BOOST == 0)
+      mlfq_boost();
     wakeup(&ticks);
     release(&tickslock);
   }

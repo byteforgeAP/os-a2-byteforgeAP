@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "pinfo.h"
 
 struct cpu cpus[NCPU];
 
@@ -25,6 +26,14 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+// MLFQ time slice, in ticks, for each level.
+static const int mlfq_slice[MLFQ_LEVELS] = {1, 2, 4, 8};
+
+// Per-level round-robin cursor: index in proc[] of the slot most
+// recently chosen from that level. Shared by all CPUs; accessed with
+// atomic loads/stores so no extra lock is needed.
+static int mlfq_cursor[MLFQ_LEVELS] = {NPROC - 1, NPROC - 1, NPROC - 1, NPROC - 1};
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -125,6 +134,15 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  // Fresh statistics and MLFQ state; a kfork() child inherits nothing.
+  // ticks is read without tickslock: lock order is tickslock -> p->lock,
+  // and we hold p->lock. Off by one tick is fine.
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = ticks;
+  p->level = 0;
+  p->used = 0;
+
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     freeproc(p);
@@ -167,6 +185,11 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = 0;
+  p->level = 0;
+  p->used = 0;
   p->state = UNUSED;
 }
 
@@ -441,14 +464,44 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
+    // Pass 1: find the highest-priority (lowest-numbered) level
+    // that has a RUNNABLE process. Hold one p->lock at a time.
+    int best = MLFQ_LEVELS;
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if (p->state == RUNNABLE) {
+      if (p->state == RUNNABLE && p->level < best)
+        best = p->level;
+      release(&p->lock);
+      if (best == 0)
+        break;
+    }
+
+    if (best == MLFQ_LEVELS) {
+      // Nothing to run. Keep polling instead of halting in wfi: xv6 has
+      // no IPIs, so a process woken by another CPU would otherwise wait
+      // up to a full tick for an idle core. Under MLFQ the waking CPU
+      // prefers fresh level-0 children, so a low-level process such as
+      // init (reaping orphans) could starve long enough for zombies to
+      // fill proc[] (seen as a flaky usertests reparent on CPUS=3).
+      continue;
+    }
+
+    // Pass 2: round-robin within that level, starting just after the
+    // slot most recently chosen from it. Things may have changed since
+    // pass 1, so re-check state and level under the lock.
+    int start = __atomic_load_n(&mlfq_cursor[best], __ATOMIC_RELAXED);
+    for (int i = 1; i <= NPROC; i++) {
+      int idx = (start + i) % NPROC;
+      p = &proc[idx];
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && p->level == best) {
+        __atomic_store_n(&mlfq_cursor[best], idx, __ATOMIC_RELAXED);
+
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
+        p->nsched++;
         c->proc = p;
         swtch(&c->context, &p->context);
 
@@ -458,15 +511,110 @@ scheduler(void)
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
-        found = 1;
+        release(&p->lock);
+        break;
       }
       release(&p->lock);
     }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
+    // If nothing was run (the candidate changed state), loop and rescan.
+  }
+}
+
+// Called on every timer interrupt taken by the CPU running p
+// (from both usertrap() and kerneltrap()). Charges one tick to p and
+// decides whether p should give up the CPU. Returns 1 to yield.
+// Must be called without p->lock held.
+int
+mlfq_tick(struct proc *p)
+{
+  int level;
+
+  acquire(&p->lock);
+  p->runticks++;
+  p->used++;
+  if (p->used >= mlfq_slice[p->level]) {
+    // Slice used up: demote (level 3 stays at 3), reset, and yield.
+    if (p->level < MLFQ_LEVELS - 1)
+      p->level++;
+    p->used = 0;
+    release(&p->lock);
+    return 1;
+  }
+  level = p->level;
+  release(&p->lock);
+
+  if (level == 0)
+    return 0;
+
+  // Preempt if a RUNNABLE process exists at a higher level. Never hold
+  // two p->locks at once: another CPU may be doing the same scan.
+  struct proc *q;
+  for (q = proc; q < &proc[NPROC]; q++) {
+    if (q == p)
+      continue;
+    acquire(&q->lock);
+    int higher = (q->state == RUNNABLE && q->level < level);
+    release(&q->lock);
+    if (higher)
+      return 1;
+  }
+  return 0;
+}
+
+// Priority boost: move every process to level 0 with no time used.
+// Called from clockintr() on CPU 0 with tickslock held; the lock
+// order tickslock -> p->lock matches the rest of the kernel.
+void
+mlfq_boost(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    p->level = 0;
+    p->used = 0;
+    release(&p->lock);
+  }
+}
+
+// Copy a struct pinfo for each non-UNUSED process, in proc[] order,
+// into the user array at addr, stopping after max entries.
+// Returns the number copied, or -1 if max < 0 or a copy fails.
+int
+getpinfo(uint64 addr, int max)
+{
+  struct proc *p;
+  struct pinfo info;
+  int n = 0;
+
+  if (max < 0)
+    return -1;
+
+  for (p = proc; p < &proc[NPROC] && n < max; p++) {
+    int used = 0;
+
+    acquire(&p->lock);
+    if (p->state != UNUSED) {
+      info.pid = p->pid;
+      info.state = p->state;
+      info.level = p->level;
+      info.runticks = p->runticks;
+      info.nsched = p->nsched;
+      info.ctime = p->ctime;
+      memmove(info.name, p->name, sizeof(info.name));
+      used = 1;
+    }
+    release(&p->lock);
+
+    if (used) {
+      struct proc *me = myproc();
+      if (copyout(me->pagetable, me->sz, addr + n * sizeof(info),
+                  (char *)&info, sizeof(info)) < 0)
+        return -1;
+      n++;
     }
   }
+  return n;
 }
 
 // Switch to scheduler.  Must hold only p->lock
